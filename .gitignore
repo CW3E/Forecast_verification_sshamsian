@@ -1,0 +1,17 @@
+# Large data files
+   *.nc
+   *.grib
+   *.grib2
+   *.h5
+
+   # Python
+   __pycache__/
+   *.pyc
+   .ipynb_checkpoints/
+
+   # Output and logs
+   *.log
+   output/
+
+   # OS junk
+   .DS_Store
