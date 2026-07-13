@@ -1,10 +1,13 @@
-# Objective: To create a Python script that plots AR using observation data over several days from janaury 31st to February 3rd
+# Objective: To create a Python script that plots AR using observation data over several days from janaury 31st to February 3rd and then plots a bar graph displaying data from the cts text files
 # Date: 2026-07-09
 # Author: Sina Shamsian 
+import pandas as pd # for data handling and working with dataframes
 import numpy as np # for data handling and numerical operations
 import xarray as xr # for data handling and working with netCDF files
 import matplotlib.pyplot as plt # for plotting 
 import glob # for file pattern matching
+import re
+import os # for file path handling
 from matplotlib.lines import Line2D # for creating custom legend handles
 import cartopy.crs as ccrs # For geographic projection and map features 
 import cartopy.feature as cfeature # for adding geographic features to the map
@@ -61,6 +64,64 @@ def iter_objects(ds, prefix):
     for s, n in zip(start, npts):
         xs, ys = lon[s:s+n], lat[s:s+n]
         yield np.append(xs, xs[0]), np.append(ys, ys[0])
+
+def text_file_to_dataframe(file_path):
+    """Read a single MET/MODE _cts.txt file into a cleaned DataFrame."""
+    df = pd.read_csv(file_path, sep='\s+', header=0)  # <-- fixed: header=0, not None
+
+    # Clean up column names
+    df.columns = df.columns.str.strip().str.replace(r"\s+", "_", regex=True).str.lower()
+    for c in df.select_dtypes(include="object").columns:
+        df[c] = df[c].str.strip()
+
+    # Convert statistic columns to numeric (remove leading >= or <= if present)
+    stat_cols = [
+        "total","fy_oy","fy_on","fn_oy","fn_on","baser","fmean","acc","fbias",
+        "pody","podn","pofd","far","csi","gss","hk","hss","odds","lodds","orss",
+        "eds","seds","edi","sedi","bagss"
+    ]
+    for c in stat_cols:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c].astype(str).str.replace(r"[<>]=?", "", regex=True), errors="coerce")
+
+    df = df.dropna(axis=1, how="all")
+    df = df.dropna(axis=0, subset=[col for col in ("total", "acc") if col in df.columns])
+
+    df['source_file'] = file_path
+    return df
+
+
+def parse_lead_from_filename(path):
+    """Extract lead hours from a mode_WestWRF_<L>0000L_... filename."""
+    match = re.search(r'_(\d+)L_', os.path.basename(path))
+    if match:
+        return int(match.group(1)) // 10000
+    return None
+
+
+def load_cts_for_date(init_str, ivt_level=500,
+                       base_path='/data/projects/WWRF-NRT/30YEAR-REFORECAST/MODE_verification/Raw_output/1998'):
+    """Load and concatenate all _cts.txt files for one init-time directory,
+    keeping only the first row per lead time."""
+    pattern = f'{base_path}/{init_str}/{ivt_level}/*_cts.txt'
+    files = sorted(glob.glob(pattern))
+    if not files:
+        print(f'No _cts.txt files found for {init_str} at {pattern}')
+        return pd.DataFrame()
+
+    dfs = []
+    for f in files:
+        df = text_file_to_dataframe(f)
+        df['lead_hours'] = parse_lead_from_filename(f)
+        dfs.append(df)
+
+    combined = pd.concat(dfs, ignore_index=True)
+    combined = combined.sort_values('lead_hours').reset_index(drop=True)
+
+    # --- keep only the first row per lead time ---
+    combined = combined.drop_duplicates(subset='lead_hours', keep='first').reset_index(drop=True)
+
+    return combined
 
 # --------------------------------------------------------------------------
 # --- one init-time directory per day you want to sample ---
@@ -178,3 +239,53 @@ else:
     # --- end manual labels ---
     plt.tight_layout()
     plt.show()
+# --- test the bar plotting code for HSS by valid date, grouped by lead time ------
+
+ivt_level = 500
+stat_to_plot = 'hss'  # adjust as needed
+lead_hours = [24, 48, 72, 96, 120, 144, 168]
+# --- load cts data for each date ---
+cts_by_date = {}
+for init_str, label in dates:
+    df = load_cts_for_date(init_str, ivt_level=ivt_level)
+    if df.empty:
+        print(f'No data for {label} - skipping')
+        continue
+    cts_by_date[label] = df
+
+date_labels = list(cts_by_date.keys())      # NEW line
+x = np.arange(len(date_labels))             # was: np.arange(len(lead_hours))
+n_leads = len(lead_hours)                   # was: n_dates = len(cts_by_date)
+width = 0.8 / n_leads                       # was: 0.8 / n_dates
+
+for label, df in cts_by_date.items():
+    counts = df['lead_hours'].value_counts()
+    dupes = counts[counts > 1]
+    if not dupes.empty:
+        print(f'{label}: duplicate lead_hours found:\n{dupes}\n')
+
+fig, ax = plt.subplots(figsize=(12, 6))
+
+colors = plt.cm.viridis(np.linspace(0.0, 0.9, n_leads))   # creates a choice of viridis colors for the bars, one for each lead time
+
+for i, (lead, color) in enumerate(zip(lead_hours, colors)):    # was: for i, (label, df) in enumerate(cts_by_date.items()):
+    values = []                                                  # NEW
+    for label in date_labels:                                    # NEW inner loop
+        df_indexed = cts_by_date[label].set_index('lead_hours')  # was: df.set_index('lead_hours').reindex(lead_hours)
+        val = df_indexed[stat_to_plot].get(lead, np.nan)          # was: values = df_indexed[stat_to_plot].values
+        values.append(val)                                       # NEW
+
+    offset = (i - (n_leads - 1) / 2) * width    # was: (i - (n_dates - 1) / 2) * width
+    ax.bar(x + offset, values, width, label=f'{lead}h', color=color)  # was: label=label (no color=)
+
+ax.set_xticks(x)
+ax.set_xticklabels(date_labels)                 # was: [f'{h}h' for h in lead_hours]
+ax.set_xlabel('Valid date')                     # was: 'Forecast lead time'
+ax.set_ylabel(stat_to_plot.upper())
+ax.set_title(f'{stat_to_plot.upper()} by valid date, grouped by lead time')
+ax.legend(title='Forecast lead', bbox_to_anchor=(1.02, 1), loc='upper left')  # was: title='Valid date', no bbox
+ax.set_ylim(-1, 1)
+ax.axhline(0, color='black', linewidth=0.8)
+
+plt.tight_layout()
+plt.show()
