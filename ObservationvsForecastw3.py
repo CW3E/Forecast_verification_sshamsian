@@ -1,5 +1,5 @@
 # Objective: To create a Python script that plots AR using observation data over several days from janaury 31st to February 3rd and then plots a bar graph displaying data from the cts text files
-# Date: 2026-07-09
+# Date: 2026-07-15
 # Author: Sina Shamsian 
 import pandas as pd # for data handling and working with dataframes
 import numpy as np # for data handling and numerical operations
@@ -11,6 +11,8 @@ import os # for file path handling
 from matplotlib.lines import Line2D # for creating custom legend handles
 import cartopy.crs as ccrs # For geographic projection and map features 
 import cartopy.feature as cfeature # for adding geographic features to the map
+import warnings # For filtering out warnings 
+warnings.filterwarnings('ignore') # For filtering out warnings
 
 
 # --- helper functions ----------------
@@ -123,8 +125,112 @@ def load_cts_for_date(init_str, ivt_level=500,
 
     return combined
 
-# --------------------------------------------------------------------------
+def clean_secondary_csv(path):
+    """Read and clean a single MODE secondary-output CSV (all leads in one file)."""
+    df = pd.read_csv(path, sep='\s+', engine='python', header=0)
+
+    # Parse valid_time into a real datetime
+    df['valid_time'] = pd.to_datetime(df['valid_time'], format='%Y%m%d_%H%M%S')
+
+    # Convert lead_time from MET's HHMMSS-style int into plain hours
+    df['lead_hours'] = (df['lead_time'] // 10000).astype(int)
+    df = df.drop(columns=['lead_time'])
+
+    # Round numeric columns for readability
+    numeric_cols = ['centroid_lat', 'centroid_lon', 'intersect_area',
+                     'fcst_90', 'obs_90', 'fcst_area', 'obs_area',
+                     'fcst_angle', 'obs_angle']
+    df[numeric_cols] = df[numeric_cols].round(2)
+
+    # Reorder and sort
+    cols_order = ['valid_time', 'lead_hours', 'centroid_lat', 'centroid_lon',
+                  'intersect_area', 'fcst_90', 'obs_90', 'fcst_area', 'obs_area',
+                  'fcst_angle', 'obs_angle']
+    df = df[cols_order]
+    df = df.sort_values('lead_hours').reset_index(drop=True)
+    df = df.sort_values('obs_area', ascending=False).drop_duplicates(subset='lead_hours', keep='first')
+    df['source_file'] = path
+    return df
+
+def load_secondary_for_date(init_str, ivt_level=500,
+                              base_path='/data/projects/WWRF-NRT/30YEAR-REFORECAST/MODE_verification/Secondary_output/1998'):
+    """Load and clean the secondary-output CSV for one init-time directory."""
+    pattern = f'{base_path}/{init_str}/{ivt_level}/MODE_WestWRF_*.csv'
+    files = sorted(glob.glob(pattern))
+    if not files:
+        print(f'No secondary CSV found for {init_str} at {pattern}')
+        return pd.DataFrame()
+
+    if len(files) > 1:
+        print(f'WARNING: expected 1 CSV for {init_str}, found {len(files)}: {files}')
+
+    return clean_secondary_csv(files[0])
+
+def load_secondary_for_dates(dates, ivt_level=500,
+                               base_path='/data/projects/WWRF-NRT/30YEAR-REFORECAST/MODE_verification/Secondary_output/1998'):
+    """Load and concatenate secondary-output CSVs across multiple init-time directories.
+
+    Parameters
+    ----------
+    dates : list of (init_str, label) tuples
+        e.g. [('1998013100', 'Jan 31, 1998 00Z'), ('1998020100', 'Feb 1, 1998 00Z'), ...]
+
+    Returns
+    -------
+    dict
+        Keyed by label, each value the cleaned DataFrame for that date.
+    """
+    result = {}
+    for init_str, label in dates:
+        df = load_secondary_for_date(init_str, ivt_level=ivt_level, base_path=base_path)
+        if df.empty:
+            print(f'No data for {label} - skipping')
+            continue
+        df['date_label'] = label
+        result[label] = df
+    return result
+
+
+def dist_perf(x_moe, y_moe, normalize=True):
+    """Compute the distance from the perfect forecast point (1,1) in MoE space.
+
+    Parameters
+    ----------
+    x_moe, y_moe : float or array-like
+        MoE coordinates (intersect/obs and intersect/fcst ratios), each in [0, 1].
+    normalize : bool
+        If True, divide by sqrt(2) (max possible distance) so output is in [0, 1],
+        where 0 = perfect forecast and 1 = complete miss.
+
+    Returns
+    -------
+    float or array-like
+        Distance from perfect forecast, in [0, sqrt(2)] or [0, 1] if normalized.
+    """
+    dist = np.sqrt((x_moe - 1)**2 + (y_moe - 1)**2)
+    if normalize:
+        dist = dist / np.sqrt(2)
+    return dist
+
+def compute_moe(df):
+    """Compute the Measure of Effectiveness (MoE) per DeHaan et al. 2021 (WAF).
+
+    x_moe = intersect_area / obs_area   (false-negative measure)
+    y_moe = intersect_area / fcst_area  (false-positive measure)
+
+    Points on the y=x diagonal indicate forecast and observed objects
+    are the same size (not necessarily same location).
+    Above the diagonal: forecast object smaller than observed.
+    Below the diagonal: forecast object larger than observed.
+    """
+    df = df.copy()
+    df['x_moe'] = df['intersect_area'] / df['obs_area']
+    df['y_moe'] = df['intersect_area'] / df['fcst_area']
+    return df
+# ---------------------------------------------------------------------------------# 
+# Actual code starts here, after the helper functions are defined. The following section defines the dates to be sampled and the path to the data files. It also initializes an empty list to store the file paths for each date.
 # --- one init-time directory per day you want to sample ---
+
 
 dates = [
     ('1998013100', 'Jan 31, 1998 00Z'),
@@ -132,26 +238,13 @@ dates = [
     ('1998020200', 'Feb 2, 1998 00Z'),
     ('1998020300', 'Feb 3, 1998 00Z'),
 ]
-
-# Print the available dates for the user to select from
-print('Available dates:')
-for i, (init_str, label) in enumerate(dates):
-    print(f'  {i}: {label}')
-# --- prompt user to select one date for the title's valid time ---
-selection = input('Enter the number of the date to use as the title valid time, 0 stands for the first date and 3 stands for the final date: ')
-try:
-    selected_index = int(selection)
-    selected_label = dates[selected_index][1]
-except (ValueError, IndexError):
-    print('Invalid selection - defaulting to the first date in the list.')
-    selected_label = dates[0][1]
 # ivt level to use for the plot, stored as part of the directory when searching for files
 ivt_level = 500
-base_path = '/data/projects/WWRF-NRT/30YEAR-REFORECAST/MODE_verification/Raw_output/1998'
+base_path1 = '/data/projects/WWRF-NRT/30YEAR-REFORECAST/MODE_verification/Raw_output/1998'
 
 day_files = []
 for init_str, label in dates:
-    matches = sorted(glob.glob(f'{base_path}/{init_str}/{ivt_level}/*.nc'))
+    matches = sorted(glob.glob(f'{base_path1}/{init_str}/{ivt_level}/*.nc'))
     if not matches:
         print(f'WARNING: no files found for {init_str} ({label}) - check path/date')
         continue
@@ -163,18 +256,18 @@ print('Found day files:', [(d, l) for d, l, _ in day_files])
 if not day_files:
     print('No files found for any of the requested dates. Check base_path/dates.') # backup error message if no files are found 
 else:
-    # --- diagnostic: confirm each day's obs object and coordinates ---
-    for init_str, label, path in day_files:
-        ds = xr.open_dataset(path)
-        has_obs = 'obs_simp_bdy_lon' in ds
-        n_objs = len(np.asarray(ds['obs_simp_bdy_start'])) if has_obs else 0
-        print(f'{label}: has obs boundary var = {has_obs}, n objects = {n_objs}')
-        if has_obs:
-            for xs, ys in iter_objects(ds, 'obs'):
-                print(f'   lon range {xs.min():.2f}-{xs.max():.2f}, '
-                      f'lat range {ys.min():.2f}-{ys.max():.2f}, first point ({xs[0]:.3f}, {ys[0]:.3f})')
-        ds.close()
-    # --- end diagnostic ---
+    # # --- diagnostic: confirm each day's obs object and coordinates ---
+    # for init_str, label, path in day_files:
+    #     ds = xr.open_dataset(path)
+    #     has_obs = 'obs_simp_bdy_lon' in ds
+    #     n_objs = len(np.asarray(ds['obs_simp_bdy_start'])) if has_obs else 0
+    #     print(f'{label}: has obs boundary var = {has_obs}, n objects = {n_objs}')
+    #     if has_obs:
+    #         for xs, ys in iter_objects(ds, 'obs'):
+    #             print(f'   lon range {xs.min():.2f}-{xs.max():.2f}, '
+    #                   f'lat range {ys.min():.2f}-{ys.max():.2f}, first point ({xs[0]:.3f}, {ys[0]:.3f})')
+    #     ds.close()
+    # # --- end diagnostic ---
     # The following code block below builds the map for the background of the plot
     proj = ccrs.LambertConformal(
         central_longitude=-140,
@@ -195,16 +288,17 @@ else:
         ),
         edgecolor='gray', linewidth=0.6, zorder=1
     )
-
-    #Plots a background observed IVT field for the selected date, using a reversed plasma colormap and setting the colorbar limits to 250-1000 kg m^-1 s^-1.
-    ds_ref = xr.open_dataset(day_files[selected_index][2])
-    ds_ref['obs_raw'].plot(
-        ax=ax, x='lon', y='lat', cmap='plasma_r', zorder=0,
-        transform=ccrs.PlateCarree(),
-        cbar_kwargs={'label': 'Observed IVT (kg m$^{-1}$ s$^{-1}$)'},
-        vmin=250, vmax=1000
-    )
-
+#---------------------------------------------------------------------------------------#
+# KEEP THIS SECTION COMMENTED OUT FOR NOW, AS IT IS NOT NEEDED FOR THE PLOT 
+    # #Plots a background observed IVT field for the selected date, using a reversed plasma colormap and setting the colorbar limits to 250-1000 kg m^-1 s^-1.
+    # ds_ref = xr.open_dataset(day_files[selected_index][2])
+    # ds_ref['obs_raw'].plot(
+    #     ax=ax, x='lon', y='lat', cmap='plasma_r', zorder=0,
+    #     transform=ccrs.PlateCarree(),
+    #     cbar_kwargs={'label': 'Observed IVT (kg m$^{-1}$ s$^{-1}$)'},
+    #     vmin=250, vmax=1000
+    # )
+#----------------------------------------------------------------------------------------#
     # One OBSERVED outline per day, colored by day.
     manual_colors = ['#00FF00', '#00FFFF', '#0000FF', '#FF00FF']  # green, cyan, blue, magenta 
     colors = manual_colors[:len(day_files)]
@@ -222,7 +316,7 @@ else:
         ds.close()
 
     ax.legend(handles=handles, title='Observed valid time', loc='upper right', framealpha=0.9)
-    ax.set_title(f'Observed AR shape evolution across multiple days valid time {selected_label}')
+    ax.set_title(f'Observed AR shape evolution across multiple days')
 
     gl = ax.gridlines(linewidth=0.3, color='gray', alpha=0.5,crs=ccrs.PlateCarree())
 
@@ -289,3 +383,54 @@ ax.axhline(0, color='black', linewidth=0.8)
 
 plt.tight_layout()
 plt.show()
+
+#==============================================================================#
+#----- Distance from perfect forecast and MoE code grouped by lead time ------#
+
+# --- load secondary CSVs for all dates ---
+secondary_by_date = load_secondary_for_dates(dates, ivt_level=ivt_level)
+
+# --- appling my existing compute_moe() and dist_perf() functions ---
+for label, df in secondary_by_date.items():
+    df = compute_moe(df)  # adds x_moe, y_moe columns
+    df['dist_perf'] = dist_perf(df['x_moe'], df['y_moe'])
+    secondary_by_date[label] = df
+
+# quick check
+for label, df in secondary_by_date.items():
+    print(f'{label}:')
+    print(df[['lead_hours', 'x_moe', 'y_moe', 'dist_perf']])
+
+stat_to_plot = 'dist_perf'
+lead_hours = [24, 48, 72, 96, 120, 144, 168]
+
+date_labels = list(secondary_by_date.keys()) # The .keys method returns a set-like object providing a view on the dict's keys
+x = np.arange(len(date_labels))
+n_leads = len(lead_hours)
+width = 0.8 / n_leads
+
+fig, ax = plt.subplots(figsize=(12, 6))
+
+colors = plt.cm.coolwarm(np.linspace(0.0, 0.9, n_leads))
+
+for i, (lead, color) in enumerate(zip(lead_hours, colors)): # I used enumerate here because enumerate is useful for obtaining an indexed list for example zip(lead_hours, colors) pairs up each lead time with its matching color, e.g. (24, color0), (48, color1), (72, color2), etc ..
+    values = []
+    for label in date_labels:
+        df_indexed = secondary_by_date[label].set_index('lead_hours')
+        val = df_indexed[stat_to_plot].get(lead, np.nan)
+        values.append(val)
+
+    offset = (i - (n_leads - 1) / 2) * width
+    ax.bar(x + offset, values, width, label=f'{lead}h', color=color)
+
+ax.set_xticks(x)
+ax.set_xticklabels(date_labels, rotation=30, ha='right')
+ax.set_xlabel('Valid date')
+ax.set_ylabel('Distance from perfect forecast')
+ax.set_title('Distance from perfect forecast by valid date, grouped by lead time')
+ax.legend(title='Forecast lead', bbox_to_anchor=(1.02, 1), loc='upper left')
+ax.set_ylim(0, np.sqrt(2))  # normalized since your dist_perf() default is normalize=True
+
+plt.tight_layout()
+plt.show()
+#=================================================================================#
